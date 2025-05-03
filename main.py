@@ -7,6 +7,8 @@ import sqlite3
 import tkinter as tk
 from tkinter import messagebox, ttk, filedialog
 import csv
+import json
+import os
 
 # Load models
 numberplate_model = YOLO("models/yolo11_numberplate.pt")
@@ -31,11 +33,13 @@ cursor.execute('''
 ''')
 conn.commit()
 
+
 def save_to_db(data):
     with data_lock:
         cursor.execute("INSERT INTO detections (timestamp, plate_text, confidence) VALUES (?, ?, ?)",
                        (data['Timestamp'], data['Plate Text'], data['Confidence']))
         conn.commit()
+
 
 def process_frame(frame):
     timestamp_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -88,6 +92,12 @@ def process_frame(frame):
 
     return frame
 
+
+# Thread management improvements
+threads = { }
+flag_lock = threading.Lock()
+
+
 def camera_thread(source):
     try:
         source = int(source)
@@ -103,12 +113,30 @@ def camera_thread(source):
     print(f"Stream {source} started.")
     window_name = f"Live Detection - {source}"
 
-    while running_flags.get(str(source), False):
+    # Set a fixed window size (e.g., 640x480)
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 640, 480)  # You can adjust the size as per your needs
+
+    while True:
+        with flag_lock:  # Lock the flag check to ensure thread safety
+            if not running_flags.get(str(source), False):
+                break
+
         ret, frame = cap.read()
         if not ret:
+            if not cap.isOpened():
+                print("🔌 VideoCapture not opened:", source)
+            else:
+                print("❌ Failed to grab frame from:", source)
             break
 
+        # Process the frame with detection (your existing code)
         frame = process_frame(frame)
+
+        # Resize frame to the set window size (optional)
+        # frame = cv2.resize(frame, (640, 480))  # Resize the frame to fit the window size
+
+        # Show the resized frame
         cv2.imshow(window_name, frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -117,6 +145,7 @@ def camera_thread(source):
     cap.release()
     cv2.destroyWindow(window_name)
     print(f"Stream {source} stopped.")
+
 
 def start_detection(urls_entry, status_label):
     inputs = urls_entry.get().split(',')
@@ -130,14 +159,32 @@ def start_detection(urls_entry, status_label):
         if not source:
             continue
 
-        running_flags[source] = True
-        t = threading.Thread(target=camera_thread, args=(source,))
+        with flag_lock:
+            if running_flags.get(source):
+                continue  # Already running
+            running_flags[source] = True
+
+        t = threading.Thread(target=camera_thread, args=(source,), daemon=True)
+        with flag_lock:
+            threads[source] = t
         t.start()
 
+
 def stop_detection(status_label):
-    for source in list(running_flags.keys()):
-        running_flags[source] = False
+    with flag_lock:
+        for source in list(running_flags.keys()):
+            running_flags[source] = False
+
+    # Join threads to allow clean exit
+    for source, t in list(threads.items()):
+        if t.is_alive():
+            t.join(timeout=2)
+        with flag_lock:
+            threads.pop(source, None)
+            running_flags.pop(source, None)
+
     status_label.config(text="Stopped")
+
 
 def export_to_csv():
     filename = filedialog.asksaveasfilename(defaultextension=".csv",
@@ -153,6 +200,7 @@ def export_to_csv():
         writer.writerow(["ID", "Timestamp", "Plate Text", "Confidence"])
         for row in rows:
             writer.writerow(row)
+
 
 def view_detections_window():
     db_window = tk.Toplevel()
@@ -189,31 +237,42 @@ def view_detections_window():
     cursor.execute("SELECT * FROM detections ORDER BY id DESC")
     for row in cursor.fetchall():
         tree.insert("", "end", values=row)
+
+
+URLS_FILE = "previous_urls.json"
+
+
+def load_previous_urls():
+    if os.path.exists(URLS_FILE):
+        with open(URLS_FILE, 'r') as f:
+            return json.load(f)
+    return []
+
+
+def save_previous_urls(previous_urls):
+    with open(URLS_FILE, 'w') as f:
+        json.dump(previous_urls, f)
+
+
 def main():
     root = tk.Tk()
     root.title("Helmet & Number Plate Detection")
 
-    # Frame for date and live status labels
+    # === Top Live + Date Labels ===
     top_frame = tk.Frame(root)
     top_frame.pack(fill='x', pady=5)
 
-    # Date label on the left side (shows Date and Time)
     date_label = tk.Label(top_frame, text=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), font=('Helvetica', 10))
     date_label.pack(side='left', padx=10)
 
-    # Live label on the right side with red dot when LIVE
     live_label_frame = tk.Frame(top_frame)
     live_label_frame.pack(side='right', padx=10)
-
-    # Red dot label
-    red_dot = tk.Label(live_label_frame, text="●", fg="red", font=('Helvetica', 14, 'bold'))
+    red_dot = tk.Label(live_label_frame, text="●", fg="gray", font=('Helvetica', 14, 'bold'))
     red_dot.pack(side='left')
-
-    # LIVE text label
-    live_status_label = tk.Label(live_label_frame, text="LIVE", fg='red', font=('Helvetica', 10, 'bold'))
+    live_status_label = tk.Label(live_label_frame, text="Idle", fg='gray', font=('Helvetica', 10, 'bold'))
     live_status_label.pack(side='left')
 
-    # Entry for camera URLs
+    # === URL Input ===
     tk.Label(root, text="Enter Camera Indexes or Stream URLs (comma-separated):").pack(pady=5)
     urls_entry = tk.Entry(root, width=60)
     urls_entry.pack(pady=5)
@@ -221,40 +280,105 @@ def main():
     status_label = tk.Label(root, text="Idle")
     status_label.pack(pady=5)
 
+    # === Start/Stop/View Buttons ===
     buttons_frame = tk.Frame(root)
     buttons_frame.pack(pady=5)
 
-    tk.Button(buttons_frame, text="Start Detection", command=lambda: start_detection(urls_entry, status_label)).pack(side='left', padx=10)
-    tk.Button(buttons_frame, text="Stop Detection", command=lambda: stop_detection(status_label)).pack(side='left', padx=10)
+    # These will be linked later
+    start_button = None
+    stop_button = None
 
+    # === Previously Used URLs Section ===
+    prev_frame = tk.LabelFrame(root, text="Previously Used URLs")
+    prev_frame.pack(pady=10, fill='both', padx=10)
+
+    canvas = tk.Canvas(prev_frame, height=120)
+    scrollbar = tk.Scrollbar(prev_frame, orient="vertical", command=canvas.yview)
+    scrollable_frame = tk.Frame(canvas)
+
+    scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    # === Reusable Logic ===
+    previous_urls = load_previous_urls()
+
+    def connect_single_url(url):
+        urls_entry.delete(0, tk.END)
+        urls_entry.insert(0, url)
+        start_detection(urls_entry, status_label)
+
+    def add_url_row(url):
+        row = tk.Frame(scrollable_frame)
+        row.pack(fill='x', pady=2, padx=5)
+
+        label = tk.Label(row, text=url, anchor='w')
+        label.pack(side='left', fill='x', expand=True)
+
+        tk.Button(row, text="Connect", command=lambda u=url: connect_single_url(u)).pack(side='right', padx=5)
+
+    for u in previous_urls:
+        add_url_row(u)
+
+    def start_and_store(entry_widget, status_label):
+        input_text = entry_widget.get()
+        urls = [u.strip() for u in input_text.split(',') if u.strip()]
+        updated = False
+        for u in urls:
+            if u not in previous_urls:
+                previous_urls.append(u)
+                add_url_row(u)
+                updated = True
+        if updated:
+            save_previous_urls(previous_urls)
+        start_detection(entry_widget, status_label)
+
+    def connect_all_urls():
+        if not previous_urls:
+            messagebox.showwarning("No URLs", "No previous URLs to connect.")
+            return
+        urls_entry.delete(0, tk.END)
+        urls_entry.insert(0, ', '.join(previous_urls))
+        start_detection(urls_entry, status_label)
+
+    # === Buttons Finalize ===
+    tk.Button(buttons_frame, text="Start Detection", command=lambda: start_and_store(urls_entry, status_label)).pack(
+        side='left', padx=10)
+    tk.Button(buttons_frame, text="Stop Detection", command=lambda: stop_detection(status_label)).pack(side='left',
+                                                                                                       padx=10)
     tk.Button(root, text="View Detections", command=view_detections_window).pack(side='right', padx=10, pady=10)
+    tk.Button(root, text="Connect All Previous URLs", command=connect_all_urls).pack(pady=5)
 
-    # Refresh the date and live status dynamically
+    # === Live Date & Status Updater ===
     def update_labels():
-        # Update date and time
         date_label.config(text=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-
-        # Update live status and red dot visibility
         if any(running_flags.values()):
-            live_status_label.config(text="LIVE")
+            live_status_label.config(text="LIVE", fg="red")
             red_dot.config(fg="red")
         else:
-            live_status_label.config(text="Idle")
+            live_status_label.config(text="Idle", fg="gray")
             red_dot.config(fg="gray")
-
-        # Refresh every second
         root.after(1000, update_labels)
 
     update_labels()
 
-    root.protocol("WM_DELETE_WINDOW", lambda: quit_program(root, status_label))
+    def on_close():
+        save_previous_urls(previous_urls)
+        quit_program(root, status_label)
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
+
 
 def quit_program(root, status_label):
     stop_detection(status_label)
     cv2.destroyAllWindows()
     root.quit()
     root.destroy()
+
 
 if __name__ == "__main__":
     main()
