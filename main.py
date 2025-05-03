@@ -97,8 +97,7 @@ def process_frame(frame):
 threads = { }
 flag_lock = threading.Lock()
 
-
-def camera_thread(source):
+def camera_thread(source, stop_event):
     try:
         source = int(source)
     except ValueError:
@@ -113,15 +112,10 @@ def camera_thread(source):
     print(f"Stream {source} started.")
     window_name = f"Live Detection - {source}"
 
-    # Set a fixed window size (e.g., 640x480)
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, 640, 480)  # You can adjust the size as per your needs
+    cv2.resizeWindow(window_name, 640, 480)
 
-    while True:
-        with flag_lock:  # Lock the flag check to ensure thread safety
-            if not running_flags.get(str(source), False):
-                break
-
+    while not stop_event.is_set():
         ret, frame = cap.read()
         if not ret:
             if not cap.isOpened():
@@ -130,13 +124,8 @@ def camera_thread(source):
                 print("❌ Failed to grab frame from:", source)
             break
 
-        # Process the frame with detection (your existing code)
         frame = process_frame(frame)
 
-        # Resize frame to the set window size (optional)
-        # frame = cv2.resize(frame, (640, 480))  # Resize the frame to fit the window size
-
-        # Show the resized frame
         cv2.imshow(window_name, frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -146,7 +135,6 @@ def camera_thread(source):
     cv2.destroyWindow(window_name)
     print(f"Stream {source} stopped.")
 
-
 def start_detection(urls_entry, status_label):
     inputs = urls_entry.get().split(',')
     if not inputs:
@@ -154,37 +142,35 @@ def start_detection(urls_entry, status_label):
         return
 
     status_label.config(text="Detection running...")
+
+    stop_events = {}
     for source in inputs:
         source = source.strip()
         if not source:
             continue
 
-        with flag_lock:
-            if running_flags.get(source):
-                continue  # Already running
-            running_flags[source] = True
+        if running_flags.get(source):
+            continue  # Already running
+        running_flags[source] = True
 
-        t = threading.Thread(target=camera_thread, args=(source,), daemon=True)
-        with flag_lock:
-            threads[source] = t
+        stop_event = threading.Event()
+        stop_events[source] = stop_event
+
+        t = threading.Thread(target=camera_thread, args=(source, stop_event), daemon=True)
+        threads[source] = t
         t.start()
-
 
 def stop_detection(status_label):
     with flag_lock:
-        for source in list(running_flags.keys()):
-            running_flags[source] = False
+        for source, stop_event in stop_events.items():
+            stop_event.set()  # Signal to stop the thread
 
-    # Join threads to allow clean exit
-    for source, t in list(threads.items()):
+    # Wait for threads to stop gracefully
+    for source, t in threads.items():
         if t.is_alive():
             t.join(timeout=2)
-        with flag_lock:
-            threads.pop(source, None)
-            running_flags.pop(source, None)
 
     status_label.config(text="Stopped")
-
 
 def export_to_csv():
     filename = filedialog.asksaveasfilename(defaultextension=".csv",
