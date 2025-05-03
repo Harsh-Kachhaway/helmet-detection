@@ -273,21 +273,93 @@ def view_detections_window():
         tree.insert("", "end", values=row)
 
 
+
+# File to store previously used URLs
 URLS_FILE = "previous_urls.json"
 
-
+# Load the previous URLs from the JSON file
 def load_previous_urls():
     if os.path.exists(URLS_FILE):
         with open(URLS_FILE, 'r') as f:
             return json.load(f)
     return []
 
-
+# Save the updated list of URLs to the JSON file
 def save_previous_urls(previous_urls):
     with open(URLS_FILE, 'w') as f:
         json.dump(previous_urls, f)
 
+# Add a URL to the list in the UI and in the saved file
+def add_url_row(url, scrollable_frame, previous_urls, urls_entry, status_label):
+    row = tk.Frame(scrollable_frame)
+    row.pack(fill='x', pady=2, padx=5)
 
+    label = tk.Label(row, text=url, anchor='w')
+    label.pack(side='left', fill='x', expand=True)
+
+    # Connect button
+    connect_button = tk.Button(row, text="Connect", command=lambda u=url: connect_single_url(u, urls_entry, status_label))
+    connect_button.pack(side='right', padx=5)
+
+    # Remove button
+    remove_button = tk.Button(row, text="Remove", command=lambda u=url, r=row: remove_url(u, r, previous_urls))
+    remove_button.pack(side='right', padx=5)
+
+
+def connect_single_url(url, urls_entry, status_label):
+    if not running_flags.get(url):
+        urls_entry.delete(0, tk.END)
+        urls_entry.insert(0, url)
+        start_detection(urls_entry, status_label)
+
+
+
+# Remove a URL from the list in the UI and the file
+def remove_url(url, row, previous_urls):
+    if url in previous_urls:
+        previous_urls.remove(url)
+        save_previous_urls(previous_urls)  # Save the updated list to the file
+
+        row.destroy()  # Remove the row from the UI
+
+# Update the list of URLs in the UI
+def update_url_list(scrollable_frame, previous_urls):
+    # Clear existing URLs
+    for widget in scrollable_frame.winfo_children():
+        widget.destroy()
+
+    # Add updated URLs to the UI
+    for u in previous_urls:
+        add_url_row(u, scrollable_frame, previous_urls)
+
+def start_and_store(entry_widget, status_label, previous_urls, scrollable_frame):
+    input_text = entry_widget.get()
+    urls = [u.strip() for u in input_text.split(',') if u.strip()]
+    updated = False
+
+    # Add any new URLs
+    for u in urls:
+        if u not in previous_urls:
+            previous_urls.append(u)
+            # Pass urls_entry and status_label when calling add_url_row
+            add_url_row(u, scrollable_frame, previous_urls, entry_widget, status_label)
+            updated = True
+
+    if updated:
+        save_previous_urls(previous_urls)
+
+    start_detection(entry_widget, status_label)
+
+
+def connect_all_urls(previous_urls, entry_widget, status_label):
+    if not previous_urls:
+        messagebox.showwarning("No URLs", "No previous URLs to connect.")
+        return
+    entry_widget.delete(0, tk.END)
+    entry_widget.insert(0, ', '.join(previous_urls))
+    start_detection(entry_widget, status_label)
+
+# Your main function to set up the GUI and callbacks
 def main():
     root = tk.Tk()
     root.title("Helmet & Number Plate Detection")
@@ -318,7 +390,6 @@ def main():
     buttons_frame = tk.Frame(root)
     buttons_frame.pack(pady=5)
 
-    # These will be linked later
     start_button = None
     stop_button = None
 
@@ -340,51 +411,26 @@ def main():
     # === Reusable Logic ===
     previous_urls = load_previous_urls()
 
-    def connect_single_url(url):
-        urls_entry.delete(0, tk.END)
-        urls_entry.insert(0, url)
-        start_detection(urls_entry, status_label)
-
-    def add_url_row(url):
-        row = tk.Frame(scrollable_frame)
-        row.pack(fill='x', pady=2, padx=5)
-
-        label = tk.Label(row, text=url, anchor='w')
-        label.pack(side='left', fill='x', expand=True)
-
-        tk.Button(row, text="Connect", command=lambda u=url: connect_single_url(u)).pack(side='right', padx=5)
-
+    # Add the previous URLs to the UI
     for u in previous_urls:
-        add_url_row(u)
+        add_url_row(u, scrollable_frame, previous_urls, urls_entry, status_label)
 
-    def start_and_store(entry_widget, status_label):
-        input_text = entry_widget.get()
-        urls = [u.strip() for u in input_text.split(',') if u.strip()]
-        updated = False
-        for u in urls:
-            if u not in previous_urls:
-                previous_urls.append(u)
-                add_url_row(u)
-                updated = True
-        if updated:
-            save_previous_urls(previous_urls)
-        start_detection(entry_widget, status_label)
+    # Wrapper function to call start_and_store with the correct arguments
+    def start_and_store_wrapper():
+        start_and_store(urls_entry, status_label, previous_urls, scrollable_frame)
 
-    def connect_all_urls():
-        if not previous_urls:
-            messagebox.showwarning("No URLs", "No previous URLs to connect.")
-            return
-        urls_entry.delete(0, tk.END)
-        urls_entry.insert(0, ', '.join(previous_urls))
-        start_detection(urls_entry, status_label)
+    # Wrapper function to call connect_all_urls with the correct arguments
+    def connect_all_urls_wrapper():
+        connect_all_urls(previous_urls, urls_entry, status_label)
 
     # === Buttons Finalize ===
-    tk.Button(buttons_frame, text="Start Detection", command=lambda: start_and_store(urls_entry, status_label)).pack(
-        side='left', padx=10)
-    tk.Button(buttons_frame, text="Stop Detection", command=lambda: stop_detection(status_label)).pack(side='left',
-                                                                                                       padx=10)
-    tk.Button(root, text="View Detections", command=view_detections_window).pack(side='right', padx=10, pady=10)
-    tk.Button(root, text="Connect All Previous URLs", command=connect_all_urls).pack(pady=5)
+    tk.Button(buttons_frame, text="Start Detection", command=start_and_store_wrapper).pack(side='left', padx=10)
+    tk.Button(buttons_frame, text="Stop Detection", command=lambda: stop_detection(status_label)).pack(side='left', padx=10)
+    tk.Button(root, text="Connect All Previous URLs", command=connect_all_urls_wrapper).pack(pady=5)
+
+    # === View Detection Records Button ===
+    view_button = tk.Button(root, text="View Detection Records", command=view_detections_window)
+    view_button.pack(side='right', padx=10, pady=10, anchor='se')
 
     # === Live Date & Status Updater ===
     def update_labels():
