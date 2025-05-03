@@ -134,6 +134,43 @@ def camera_thread(source, stop_event):
     cap.release()
     cv2.destroyWindow(window_name)
     print(f"Stream {source} stopped.")
+def camera_thread(source, stop_event):
+    try:
+        source = int(source)
+    except ValueError:
+        if source.startswith("http") and not source.endswith("/video"):
+            source += "/video"
+
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        print(f"Error: Could not open source {source}.")
+        return
+
+    print(f"Stream {source} started.")
+    window_name = f"Live Detection - {source}"
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 640, 480)
+
+    while not stop_event.is_set():
+        ret, frame = cap.read()
+        if not ret:
+            if not cap.isOpened():
+                print("🔌 VideoCapture not opened:", source)
+            else:
+                print("❌ Failed to grab frame from:", source)
+            break
+
+        frame = process_frame(frame)
+
+        cv2.imshow(window_name, frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyWindow(window_name)
+    print(f"Stream {source} stopped.")
 
 def start_detection(urls_entry, status_label):
     inputs = urls_entry.get().split(',')
@@ -143,32 +180,43 @@ def start_detection(urls_entry, status_label):
 
     status_label.config(text="Detection running...")
 
-    stop_events = {}
+    # Start detection for each input source
     for source in inputs:
         source = source.strip()
         if not source:
             continue
 
+        # If the source is already running, skip
         if running_flags.get(source):
-            continue  # Already running
+            continue
         running_flags[source] = True
 
+        # Create a stop_event for the thread
         stop_event = threading.Event()
-        stop_events[source] = stop_event
 
+        # Start a new thread for each camera stream
         t = threading.Thread(target=camera_thread, args=(source, stop_event), daemon=True)
-        threads[source] = t
+        threads[source] = {"thread": t, "stop_event": stop_event}
         t.start()
 
 def stop_detection(status_label):
-    with flag_lock:
-        for source, stop_event in stop_events.items():
-            stop_event.set()  # Signal to stop the thread
+    status_label.config(text="Stopping...")
 
-    # Wait for threads to stop gracefully
-    for source, t in threads.items():
+    # Signal each thread to stop using the stop_event
+    for source, thread_info in threads.items():
+        stop_event = thread_info["stop_event"]
+        stop_event.set()  # This will stop the thread when it checks stop_event.is_set()
+
+    # Now join each thread to ensure it's completely stopped before continuing
+    for source, thread_info in threads.items():
+        t = thread_info["thread"]
         if t.is_alive():
-            t.join(timeout=2)
+            t.join(timeout=5)  # Wait for thread to finish (allow 5 seconds for graceful shutdown)
+
+    # Clean up threads and flags
+    with flag_lock:
+        threads.clear()
+        running_flags.clear()
 
     status_label.config(text="Stopped")
 
