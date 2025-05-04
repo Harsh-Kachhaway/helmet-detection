@@ -9,11 +9,24 @@ from tkinter import messagebox, ttk, filedialog
 import csv
 import json
 import os
+import sys
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    if getattr(sys, 'frozen', False):  # If running as a bundled executable
+        base_path = sys._MEIPASS       # PyInstaller extracts to this temp folder
+    else:
+        base_path = os.path.abspath(".")  # Use current directory in development
+    return os.path.join(base_path, relative_path)
 
 # Load models
-numberplate_model = YOLO("models/yolo11_numberplate.pt")
-bike_model = YOLO("models/yolo11_bikedetection.pt")
-helmet_model = YOLO("models/yolo11_helmetdetection.pt")
+print("Loading helmet model NUMBERPLATE...")
+numberplate_model = YOLO(resource_path("models/yolo11_numberplate.pt"))
+print("Loading helmet model BIKE...")
+bike_model = YOLO(resource_path("models/yolo11_bikedetection.pt"))
+print("Loading helmet model HELMET...")
+helmet_model = YOLO(resource_path("models/yolo11_helmetdetection.pt"))
+print("Loading helmet model...")
 
 # Threading control
 running_flags = {}
@@ -21,7 +34,7 @@ ocr_data = []
 data_lock = threading.Lock()
 
 # SQLite setup
-conn = sqlite3.connect("detection_data.db", check_same_thread=False)
+conn = sqlite3.connect(resource_path("data/detection_data.db"), check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS detections (
@@ -33,114 +46,119 @@ cursor.execute('''
 ''')
 conn.commit()
 
-
 def save_to_db(data):
     with data_lock:
         cursor.execute("INSERT INTO detections (timestamp, plate_text, confidence) VALUES (?, ?, ?)",
                        (data['Timestamp'], data['Plate Text'], data['Confidence']))
         conn.commit()
 
-
 def process_frame(frame):
     timestamp_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # Remove the "LIVE" overlay from the frame
+    number_plate_detected = False
+    plate_text = ""
+    bikes = []
 
+    # Number Plate Detection ......
     results_plate = numberplate_model(frame)
     for result in results_plate:
         for box in result.boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             conf = float(box.conf[0])
-            plate_crop = frame[y1:y2, x1:x2]
-            gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
-            plate_text = pytesseract.image_to_string(gray, config='--psm 7').strip()
+            if conf >= 0.2:
+                plate_crop = frame[y1:y2, x1:x2]
+                gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
+                plate_text = pytesseract.image_to_string(gray, config='--psm 7').strip()
 
-            if plate_text and conf >= 0.75:
-                data = {
-                    "Timestamp": timestamp_text,
-                    "Plate Text": plate_text,
-                    "Confidence": round(conf, 2)
-                }
-                save_to_db(data)
-                cv2.putText(frame, plate_text, (x1, y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+                if plate_text:
+                    number_plate_detected = True
+                    cv2.putText(frame, plate_text, (x1, y1 - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 2)
 
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 2)
+    # Bike Detection.....if plate ........
+    if number_plate_detected:
+        results_bike = bike_model(frame)
+        for result in results_bike:
+            for box in result.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                bikes.append((x1, y1, x2, y2))
+                label = result.names[int(box.cls[0])]
+                conf = float(box.conf[0])
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                cv2.putText(frame, f'{label} ({conf:.2f})', (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
-    results_bike = bike_model(frame)
-    bikes = []
-    for result in results_bike:
-        for box in result.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            bikes.append((x1, y1, x2, y2))
-            label = result.names[int(box.cls[0])]
-            conf = float(box.conf[0])
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-            cv2.putText(frame, f'{label} ({conf:.2f})', (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+        # Helmet Detection ...if bike..........
+        results_helmet = helmet_model(frame)
+        for result in results_helmet:
+            for box in result.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                conf = float(box.conf[0])
+                inside_bike = any(bx1 < x1 < bx2 and by1 < y1 < by2 for bx1, by1, bx2, by2 in bikes)
+                tag = "Helmet" if inside_bike else "No Helmet"
+                color = (0, 255, 0) if inside_bike else (0, 0, 255)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frame, f'{tag} ({conf:.2f})', (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-    results_helmet = helmet_model(frame)
-    for result in results_helmet:
-        for box in result.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            conf = float(box.conf[0])
-            inside_bike = any(bx1 < x1 < bx2 and by1 < y1 < by2 for bx1, by1, bx2, by2 in bikes)
-            color = (0, 255, 0) if inside_bike else (0, 0, 255)
-            tag = "Helmet" if inside_bike else "No Helmet"
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, f'{tag} ({conf:.2f})', (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                # Save only if no helmet and number plate is known.....
+                if not inside_bike and plate_text:
+                    data = {
+                        "Timestamp": timestamp_text,
+                        "Plate Text": plate_text,
+                        "Helmet Status": "No Helmet",
+                        "Confidence": round(conf, 2)
+                    }
+                    save_to_db(data)
 
     return frame
 
 
-# Thread management improvements
+# Thread management...use for multi window..
 threads = { }
 flag_lock = threading.Lock()
 
+
 def camera_thread(source, stop_event):
+    data_folder = "input"
+
     try:
         source = int(source)
+        input_type = "video"
     except ValueError:
-        if source.startswith("http") and not source.endswith("/video"):
+        # Handle image from "data" folder...
+        full_path = os.path.join(data_folder, source)
+        if os.path.isfile(full_path) and full_path.lower().endswith(('.jpg', '.jpeg', '.png')):
+            input_type = "image"
+            source = full_path
+        elif source.startswith("http") and not source.endswith("/video"):
             source += "/video"
+            input_type = "video"
+        else:
+            input_type = "video"
 
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
-        print(f"Error: Could not open source {source}.")
-        return
+    # Image handling....
+    if input_type == "image":
+        frame = cv2.imread(source)
+        if frame is None:
+            print(f"Error: Could not load image {source}.")
+            return
 
-    print(f"Stream {source} started.")
-    window_name = f"Live Detection - {source}"
-
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, 640, 480)
-
-    while not stop_event.is_set():
-        ret, frame = cap.read()
-        if not ret:
-            if not cap.isOpened():
-                print("🔌 VideoCapture not opened:", source)
-            else:
-                print("❌ Failed to grab frame from:", source)
-            break
-
+        print(f"Image {source} loaded.")
         frame = process_frame(frame)
+        window_name = f"Image Detection - {os.path.basename(source)}"
 
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, 640, 480)
         cv2.imshow(window_name, frame)
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        print("Press any key to close the image window...")
+        cv2.waitKey(0)
+        cv2.destroyWindow(window_name)
+        print(f"Image {source} display closed.")
+        return
 
-    cap.release()
-    cv2.destroyWindow(window_name)
-    print(f"Stream {source} stopped.")
-def camera_thread(source, stop_event):
-    try:
-        source = int(source)
-    except ValueError:
-        if source.startswith("http") and not source.endswith("/video"):
-            source += "/video"
-
+    # Video handling..
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
         print(f"Error: Could not open source {source}.")
@@ -148,7 +166,6 @@ def camera_thread(source, stop_event):
 
     print(f"Stream {source} started.")
     window_name = f"Live Detection - {source}"
-
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 640, 480)
 
@@ -162,7 +179,6 @@ def camera_thread(source, stop_event):
             break
 
         frame = process_frame(frame)
-
         cv2.imshow(window_name, frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -180,21 +196,21 @@ def start_detection(urls_entry, status_label):
 
     status_label.config(text="Detection running...")
 
-    # Start detection for each input source
+    # Start detection for each input source..
     for source in inputs:
         source = source.strip()
         if not source:
             continue
 
-        # If the source is already running, skip
+        # If running, skip....
         if running_flags.get(source):
             continue
         running_flags[source] = True
 
-        # Create a stop_event for the thread
+        # create a stop_event for the thread...
         stop_event = threading.Event()
 
-        # Start a new thread for each camera stream
+        # start a new thread for each camera stream...
         t = threading.Thread(target=camera_thread, args=(source, stop_event), daemon=True)
         threads[source] = {"thread": t, "stop_event": stop_event}
         t.start()
@@ -202,18 +218,18 @@ def start_detection(urls_entry, status_label):
 def stop_detection(status_label):
     status_label.config(text="Stopping...")
 
-    # Signal each thread to stop using the stop_event
+    # each thread to stop using the stop_event....
     for source, thread_info in threads.items():
         stop_event = thread_info["stop_event"]
         stop_event.set()  # This will stop the thread when it checks stop_event.is_set()
 
-    # Now join each thread to ensure it's completely stopped before continuing
+    # join each thread to ensure it completely stopped before continuing...
     for source, thread_info in threads.items():
         t = thread_info["thread"]
         if t.is_alive():
-            t.join(timeout=5)  # Wait for thread to finish (allow 5 seconds for graceful shutdown)
+            t.join(timeout=5)  # 5second timer hai bhai.
 
-    # Clean up threads and flags
+    # Clean up threads and flags..
     with flag_lock:
         threads.clear()
         running_flags.clear()
@@ -274,22 +290,22 @@ def view_detections_window():
 
 
 
-# File to store previously used URLs
-URLS_FILE = "previous_urls.json"
+# stores previously used url....
+URLS_FILE = resource_path("data/previous_urls.json")
 
-# Load the previous URLs from the JSON file
+# loda previously file...
 def load_previous_urls():
     if os.path.exists(URLS_FILE):
         with open(URLS_FILE, 'r') as f:
             return json.load(f)
     return []
 
-# Save the updated list of URLs to the JSON file
+# it saves it
 def save_previous_urls(previous_urls):
     with open(URLS_FILE, 'w') as f:
         json.dump(previous_urls, f)
 
-# Add a URL to the list in the UI and in the saved file
+# url to ui
 def add_url_row(url, scrollable_frame, previous_urls, urls_entry, status_label):
     row = tk.Frame(scrollable_frame)
     row.pack(fill='x', pady=2, padx=5)
@@ -297,11 +313,11 @@ def add_url_row(url, scrollable_frame, previous_urls, urls_entry, status_label):
     label = tk.Label(row, text=url, anchor='w')
     label.pack(side='left', fill='x', expand=True)
 
-    # Connect button
+    # connect button
     connect_button = tk.Button(row, text="Connect", command=lambda u=url: connect_single_url(u, urls_entry, status_label))
     connect_button.pack(side='right', padx=5)
 
-    # Remove button
+    # remove button
     remove_button = tk.Button(row, text="Remove", command=lambda u=url, r=row: remove_url(u, r, previous_urls))
     remove_button.pack(side='right', padx=5)
 
@@ -314,21 +330,21 @@ def connect_single_url(url, urls_entry, status_label):
 
 
 
-# Remove a URL from the list in the UI and the file
+# remove a URL from the list in the UI and the file..
 def remove_url(url, row, previous_urls):
     if url in previous_urls:
         previous_urls.remove(url)
-        save_previous_urls(previous_urls)  # Save the updated list to the file
+        save_previous_urls(previous_urls)  # Save the updated list to the file.
 
-        row.destroy()  # Remove the row from the UI
+        row.destroy()  # Remove the row from the UI..
 
-# Update the list of URLs in the UI
+# update the list of URLs in the UI
 def update_url_list(scrollable_frame, previous_urls):
-    # Clear existing URLs
+    # clear existing URLs
     for widget in scrollable_frame.winfo_children():
         widget.destroy()
 
-    # Add updated URLs to the UI
+    # add updated URLs to the UI...
     for u in previous_urls:
         add_url_row(u, scrollable_frame, previous_urls)
 
@@ -337,7 +353,7 @@ def start_and_store(entry_widget, status_label, previous_urls, scrollable_frame)
     urls = [u.strip() for u in input_text.split(',') if u.strip()]
     updated = False
 
-    # Add any new URLs
+    # add any new URLs
     for u in urls:
         if u not in previous_urls:
             previous_urls.append(u)
@@ -350,7 +366,6 @@ def start_and_store(entry_widget, status_label, previous_urls, scrollable_frame)
 
     start_detection(entry_widget, status_label)
 
-
 def connect_all_urls(previous_urls, entry_widget, status_label):
     if not previous_urls:
         messagebox.showwarning("No URLs", "No previous URLs to connect.")
@@ -359,12 +374,12 @@ def connect_all_urls(previous_urls, entry_widget, status_label):
     entry_widget.insert(0, ', '.join(previous_urls))
     start_detection(entry_widget, status_label)
 
-# Your main function to set up the GUI and callbacks
+# main function to set up the GUI and callbacks....
 def main():
     root = tk.Tk()
     root.title("Helmet & Number Plate Detection")
 
-    # === Top Live + Date Labels ===
+    # live and date lable
     top_frame = tk.Frame(root)
     top_frame.pack(fill='x', pady=5)
 
@@ -378,7 +393,7 @@ def main():
     live_status_label = tk.Label(live_label_frame, text="Idle", fg='gray', font=('Helvetica', 10, 'bold'))
     live_status_label.pack(side='left')
 
-    # === URL Input ===
+    # url input
     tk.Label(root, text="Enter Camera Indexes or Stream URLs (comma-separated):").pack(pady=5)
     urls_entry = tk.Entry(root, width=60)
     urls_entry.pack(pady=5)
@@ -386,14 +401,14 @@ def main():
     status_label = tk.Label(root, text="Idle")
     status_label.pack(pady=5)
 
-    # === Start/Stop/View Buttons ===
+    # start stop
     buttons_frame = tk.Frame(root)
     buttons_frame.pack(pady=5)
 
     start_button = None
     stop_button = None
 
-    # === Previously Used URLs Section ===
+    # previous url
     prev_frame = tk.LabelFrame(root, text="Previously Used URLs")
     prev_frame.pack(pady=10, fill='both', padx=10)
 
@@ -408,22 +423,19 @@ def main():
     canvas.pack(side="left", fill="both", expand=True)
     scrollbar.pack(side="right", fill="y")
 
-    # === Reusable Logic ===
+    # to reuse
     previous_urls = load_previous_urls()
 
-    # Add the previous URLs to the UI
     for u in previous_urls:
         add_url_row(u, scrollable_frame, previous_urls, urls_entry, status_label)
 
-    # Wrapper function to call start_and_store with the correct arguments
     def start_and_store_wrapper():
         start_and_store(urls_entry, status_label, previous_urls, scrollable_frame)
 
-    # Wrapper function to call connect_all_urls with the correct arguments
     def connect_all_urls_wrapper():
         connect_all_urls(previous_urls, urls_entry, status_label)
 
-    # === Buttons Finalize ===
+    # muttons...
     tk.Button(buttons_frame, text="Start Detection", command=start_and_store_wrapper).pack(side='left', padx=10)
     tk.Button(buttons_frame, text="Stop Detection", command=lambda: stop_detection(status_label)).pack(side='left', padx=10)
     tk.Button(root, text="Connect All Previous URLs", command=connect_all_urls_wrapper).pack(pady=5)
@@ -432,7 +444,7 @@ def main():
     view_button = tk.Button(root, text="View Detection Records", command=view_detections_window)
     view_button.pack(side='right', padx=10, pady=10, anchor='se')
 
-    # === Live Date & Status Updater ===
+    #  live date ... status updater ....
     def update_labels():
         date_label.config(text=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         if any(running_flags.values()):
